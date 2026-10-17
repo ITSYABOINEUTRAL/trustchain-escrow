@@ -8,6 +8,11 @@
  */
 
 import { queueMetrics } from '../lib/queueConfig.js';
+import client from 'prom-client';
+import { createModuleLogger } from '../config/logger.js';
+import { register } from '../lib/metrics.js';
+
+const logger = createModuleLogger('service.alertService');
 
 /**
  * Alert severity levels
@@ -46,6 +51,37 @@ const ALERT_CONFIG = {
  * Track last sent alerts to prevent spam
  */
 const lastAlerts = new Map();
+
+const syncLagGauge = new client.Gauge({
+  name: 'indexer_sync_lag_ms',
+  help: 'Indexer sync lag in milliseconds',
+  labelNames: ['status'],
+  registers: [register],
+});
+
+const recordSyncLagTelemetry = (syncLag) => {
+  const valid = Number.isFinite(syncLag) && syncLag >= 0;
+  const status = !valid
+    ? 'invalid'
+    : syncLag > ALERT_CONFIG.SYNC_LAG_THRESHOLD
+      ? 'high'
+      : 'normal';
+
+  try {
+    syncLagGauge.set({ status }, valid ? syncLag : 0);
+    logger.info({
+      message: 'indexer_sync_lag_calculated',
+      correlationId: 'indexer-sync-lag',
+      lagMs: valid ? syncLag : null,
+      thresholdMs: ALERT_CONFIG.SYNC_LAG_THRESHOLD,
+      status,
+    });
+  } catch {
+    console.warn('[Alert] Sync-lag telemetry unavailable');
+  }
+
+  return valid;
+};
 
 /**
  * Check if an alert should be sent (cooldown period)
@@ -255,7 +291,8 @@ export const monitorQueueHealth = async () => {
 
     // Check sync lag (would need to be calculated from event timestamps)
     const syncLag = await calculateSyncLag();
-    if (syncLag > ALERT_CONFIG.SYNC_LAG_THRESHOLD) {
+    const validSyncLag = recordSyncLagTelemetry(syncLag);
+    if (validSyncLag && syncLag > ALERT_CONFIG.SYNC_LAG_THRESHOLD) {
       await sendAlert({
         type: ALERT_TYPES.SYNC_LAG_HIGH,
         severity: syncLag > 60000 ? ALERT_SEVERITY.ERROR : ALERT_SEVERITY.WARNING,
@@ -266,8 +303,8 @@ export const monitorQueueHealth = async () => {
         },
       });
     }
-  } catch (error) {
-    console.error('[Alert] Error monitoring queue health:', error);
+  } catch {
+    logger.error({ message: 'queue_health_monitor_failed' });
   }
 };
 
@@ -338,4 +375,5 @@ export {
   monitoringSystemAlert,
   formatEmailAlert,
   calculateSyncLag,
+  recordSyncLagTelemetry,
 };

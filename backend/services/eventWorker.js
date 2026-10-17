@@ -7,6 +7,7 @@
  * @module eventWorker
  */
 
+import { createHash } from 'node:crypto';
 import { Worker } from 'bullmq';
 import {
   connection,
@@ -14,6 +15,66 @@ import {
   deadLetterQueue,
   queueMetrics,
 } from '../lib/queueConfig.js';
+
+const FAILURE_ALERT_RETENTION_MS = 5 * 60 * 1000;
+const FAILURE_ALERT_CACHE_MAX = 1000;
+const failureAlertCache = new Map();
+
+const reserveFailureAlert = (jobId, now = Date.now()) => {
+  for (const [key, expiresAt] of failureAlertCache) {
+    if (expiresAt <= now) failureAlertCache.delete(key);
+  }
+
+  const key = createHash('sha256').update(String(jobId ?? 'unknown')).digest('hex');
+  if (failureAlertCache.has(key)) return false;
+
+  while (failureAlertCache.size >= FAILURE_ALERT_CACHE_MAX) {
+    failureAlertCache.delete(failureAlertCache.keys().next().value);
+  }
+
+  failureAlertCache.set(key, now + FAILURE_ALERT_RETENTION_MS);
+  return true;
+};
+
+const alertPermanentFailure = async (job, attemptsMade) => {
+  try {
+    const { sendAlert } = await import('./alertService.js');
+    await sendAlert({
+      type: 'permanent_event_failure',
+      severity: 'critical',
+      message: 'Event processing failed after configured retries',
+      metadata: {
+        queue: 'stellar-events',
+        attemptsMade,
+      },
+    });
+  } catch {
+    console.error('[Worker] Failure alert unavailable');
+  }
+};
+
+export const handleFailedEvent = async (job, err) => {
+  const attemptsMade = Number.isFinite(job?.attemptsMade) ? job.attemptsMade : 0;
+  console.error('[Worker] Job failed', { attemptsMade });
+
+  if (!job || attemptsMade < job.opts?.attempts) return;
+  if (!reserveFailureAlert(job.id)) return;
+
+  try {
+    await deadLetterQueue.add('dead-letter-event', {
+      originalJob: job.data,
+      error: {
+        message: err?.message || 'Unknown error',
+        stack: err?.stack,
+      },
+      attemptsMade,
+    });
+  } catch {
+    console.error('[Worker] Dead-letter enqueue unavailable');
+  }
+
+  await alertPermanentFailure(job, attemptsMade);
+};
 
 /**
  * Processes a single Stellar event
@@ -225,19 +286,7 @@ export const createEventWorker = () => {
   });
 
   worker.on('failed', (job, err) => {
-    console.error(`[Worker] Job ${job.id} failed:`, err.message);
-
-    // Move to dead letter queue after max attempts
-    if (job.attemptsMade >= job.opts.attempts) {
-      deadLetterQueue.add('dead-letter-event', {
-        originalJob: job.data,
-        error: {
-          message: err.message,
-          stack: err.stack,
-        },
-        attemptsMade: job.attemptsMade,
-      });
-    }
+    return handleFailedEvent(job, err);
   });
 
   worker.on('error', (err) => {
