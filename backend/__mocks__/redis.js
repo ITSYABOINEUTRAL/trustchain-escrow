@@ -16,3 +16,7 @@ const mockClient = {
 };
 
 export const createClient = jest.fn(() => mockClient);
+
+// Expose the shared mock client so tests can simulate optional-infrastructure
+// failures (e.g. Redis unavailable) and assert graceful degradation paths.
+export const __mockClient = mockClient;

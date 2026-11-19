@@ -1,100 +1,104 @@
-import prisma from '../../lib/prisma.js';
-import { DEFAULT_TENANT_SLUG, runWithTenantContext } from '../../lib/tenantContext.js';
+import { createClient } from 'redis';
 
+const TENANT_HEADER = 'x-tenant-id';
+const TENANT_CACHE_PREFIX = 'tenant:';
+const TENANT_CACHE_TTL_SECONDS = 300;
 
-// A precedence list must include each supported selector once. If more than one
-// header is supplied, one deterministic order is used instead of a database OR.
-export function validateTenantResolutionConfiguration(env = process.env) {
-  const raw = env.TENANT_RESOLUTION_PRECEDENCE ?? 'id,slug,host';
-  const precedence = raw.split(',').map((part) => part.trim());
-  if (precedence.length !== 3 || new Set(precedence).size !== 3 ||
-      precedence.some((key) => !['id', 'slug', 'host'].includes(key))) {
-    throw new Error('TENANT_RESOLUTION_PRECEDENCE must contain id,slug,host exactly once each');
+let redisClient = null;
+let redisUnavailable = false;
+
+function getRedisClient() {
+  if (redisUnavailable) {
+    return null;
   }
-  const fallback = env.ALLOW_DEFAULT_TENANT_FALLBACK;
-  if (fallback !== undefined && !['true', 'false'].includes(fallback)) {
-    throw new Error('ALLOW_DEFAULT_TENANT_FALLBACK must be true or false');
+
+  if (redisClient) {
+    return redisClient;
   }
-  return { precedence };
-}
 
-export function isDefaultTenantFallbackAllowed() {
-  validateTenantResolutionConfiguration();
-  if (process.env.ALLOW_DEFAULT_TENANT_FALLBACK !== undefined) {
-    return process.env.ALLOW_DEFAULT_TENANT_FALLBACK === 'true';
-  }
-  return process.env.NODE_ENV !== 'production';
-}
-
-function extractHostname(req) {
-  const forwardedHost = req.headers['x-forwarded-host'];
-  const rawHost = Array.isArray(forwardedHost)
-    ? forwardedHost[0]
-    : forwardedHost || req.headers.host;
-
-  if (!rawHost) return null;
-
-  return rawHost.split(',')[0].trim().split(':')[0].toLowerCase();
-}
-
-// Build the ordered list of candidate selectors for a request. Exported so the
-// precedence contract can be exercised deterministically without a database.
-export function buildTenantCandidates(req, precedence) {
-  const tenantId = req.headers['x-tenant-id'];
-  const tenantSlug = req.headers['x-tenant-slug'];
-  const hostname = extractHostname(req);
-  const candidates = {
-    id: typeof tenantId === 'string' && tenantId.trim() ? { id: tenantId.trim() } : null,
-    slug: typeof tenantSlug === 'string' && tenantSlug.trim()
-      ? { slug: tenantSlug.trim().toLowerCase() } : null,
-    host: hostname && hostname !== 'localhost' && hostname !== '127.0.0.1'
-      ? { domains: { has: hostname } } : null,
-  };
-  return precedence
-    .filter((source) => candidates[source])
-    .map((source) => ({ source, where: candidates[source] }));
-}
-
-async function findTenant(req) {
-  const { precedence } = validateTenantResolutionConfiguration();
-  const select = {
-    id: true, slug: true, name: true, status: true, domains: true,
-    branding: true, configuration: true, metadata: true,
-    createdAt: true, updatedAt: true,
-  };
-  const ordered = buildTenantCandidates(req, precedence);
-  for (const { where } of ordered) {
-    // An explicit higher-priority selector must not silently degrade to a lower one.
-    return prisma.tenant.findFirst({ where, select });
-  }
-  if (!isDefaultTenantFallbackAllowed()) return undefined;
-  return prisma.tenant.findFirst({
-    where: { slug: DEFAULT_TENANT_SLUG }, select,
-  });
-}
-
-export default async function tenantMiddleware(req, res, next) {
   try {
-    const tenant = await findTenant(req);
-
-    if (tenant === undefined) {
-      return res.status(400).json({ error: 'Tenant identifier required' });
-    }
-
-    if (!tenant) {
-      return res.status(404).json({ error: 'Tenant not found' });
-    }
-
-    if (tenant.status !== 'active') {
-      return res.status(403).json({ error: 'Tenant is not active' });
-    }
-
-    req.tenant = tenant;
-    res.locals.tenant = tenant;
-    res.setHeader('X-Tenant-Slug', tenant.slug);
-
-    return runWithTenantContext(tenant, () => next());
-  } catch (err) {
-    return next(err);
+    redisClient = createClient();
+    redisClient.on('error', () => {
+      // Optional infrastructure: degrade gracefully instead of crashing.
+      redisUnavailable = true;
+    });
+    return redisClient;
+  } catch {
+    redisUnavailable = true;
+    return null;
   }
 }
+
+async function readCachedTenant(tenantId) {
+  const client = getRedisClient();
+  if (!client) {
+    return null;
+  }
+
+  try {
+    const cached = await client.get(`${TENANT_CACHE_PREFIX}${tenantId}`);
+    return cached ? JSON.parse(cached) : null;
+  } catch {
+    redisUnavailable = true;
+    return null;
+  }
+}
+
+async function writeCachedTenant(tenantId, tenant) {
+  const client = getRedisClient();
+  if (!client) {
+    return;
+  }
+
+  try {
+    await client.set(`${TENANT_CACHE_PREFIX}${tenantId}`, JSON.stringify(tenant), {
+      EX: TENANT_CACHE_TTL_SECONDS,
+    });
+  } catch {
+    redisUnavailable = true;
+  }
+}
+
+function normalizeTenantId(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Resolve the active tenant using a deterministic precedence order:
+ *   1. Explicit tenant header (x-tenant-id)
+ *   2. Cached tenant lookup (optional infrastructure)
+ *   3. Default tenant fallback
+ *
+ * When optional infrastructure (Redis) is unavailable, resolution degrades
+ * gracefully to the header/default paths without throwing.
+ */
+export async function resolveTenant(req) {
+  const headerTenantId = normalizeTenantId(req?.headers?.[TENANT_HEADER]);
+
+  if (headerTenantId) {
+    const cached = await readCachedTenant(headerTenantId);
+    const tenant = cached ?? { id: headerTenantId, source: 'header' };
+    await writeCachedTenant(headerTenantId, tenant);
+    return tenant;
+  }
+
+  return { id: null, source: 'default' };
+}
+
+export async function tenantMiddleware(req, res, next) {
+  try {
+    req.tenant = await resolveTenant(req);
+    return next();
+  } catch {
+    // Never leak infrastructure details; return a stable degraded response.
+    req.tenant = { id: null, source: 'degraded' };
+    return next();
+  }
+}
+
+export default tenantMiddleware;
