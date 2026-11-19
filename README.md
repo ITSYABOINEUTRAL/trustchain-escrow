@@ -368,3 +368,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, the Soroban toolchain, h
 
 <!-- handsoff-issue-336 -->
 - #336: Add fuzz coverage for insurance reserve solvency
+
+<!-- handsoff-issue-497 -->
+- #497: Document `EscrowMeta` Struct Fields with Inline Rust Doc Comments
