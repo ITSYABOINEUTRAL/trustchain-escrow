@@ -37,8 +37,9 @@ function extractHostname(req) {
   return rawHost.split(',')[0].trim().split(':')[0].toLowerCase();
 }
 
-async function findTenant(req) {
-  const { precedence } = validateTenantResolutionConfiguration();
+// Build the ordered list of candidate selectors for a request. Exported so the
+// precedence contract can be exercised deterministically without a database.
+export function buildTenantCandidates(req, precedence) {
   const tenantId = req.headers['x-tenant-id'];
   const tenantSlug = req.headers['x-tenant-slug'];
   const hostname = extractHostname(req);
@@ -49,15 +50,22 @@ async function findTenant(req) {
     host: hostname && hostname !== 'localhost' && hostname !== '127.0.0.1'
       ? { domains: { has: hostname } } : null,
   };
+  return precedence
+    .filter((source) => candidates[source])
+    .map((source) => ({ source, where: candidates[source] }));
+}
+
+async function findTenant(req) {
+  const { precedence } = validateTenantResolutionConfiguration();
   const select = {
     id: true, slug: true, name: true, status: true, domains: true,
     branding: true, configuration: true, metadata: true,
     createdAt: true, updatedAt: true,
   };
-  for (const source of precedence) {
-    if (!candidates[source]) continue;
+  const ordered = buildTenantCandidates(req, precedence);
+  for (const { where } of ordered) {
     // An explicit higher-priority selector must not silently degrade to a lower one.
-    return prisma.tenant.findFirst({ where: candidates[source], select });
+    return prisma.tenant.findFirst({ where, select });
   }
   if (!isDefaultTenantFallbackAllowed()) return undefined;
   return prisma.tenant.findFirst({
